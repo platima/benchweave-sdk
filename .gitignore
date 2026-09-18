@@ -34,3 +34,8 @@ _great_docs_build/
 # ignores during packaging, silently dropping it from sdists.
 /site/
 /.docs-assembly/
+
+# In-flight standards sync: the new tree is staged here and the old one parked
+# during the swap (standards_sync._staging_paths). Outside src/ on purpose, so
+# a crash can never leave debris where packaging looks; swept by the next sync.
+/.standards-sync/

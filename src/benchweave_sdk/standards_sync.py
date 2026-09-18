@@ -7,11 +7,13 @@ content changed without a standards version increment is refused outright.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import shutil
 import tomllib
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -19,6 +21,7 @@ LOCK_NAME = "standards-lock.json"
 VENDORED = "src/benchweave_sdk/standards"
 STAMP_NAME = "_GENERATED.txt"
 STAMP_LINE = "{path} — Generated from {identifier}@{version} — do not edit"
+STAGING_DIR = ".standards-sync"
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,12 @@ def sync(bundle: Path | None, sdk_root: Path, *, check_only: bool = False) -> Sy
     document = _load_bundle(bundle)
     lock = _read_lock(sdk_root)
     previous = {row["id"]: row for row in lock.get("standards", [])}
+    # One read-and-digest pass over the bundle serves both the drift
+    # classification and the manifest integrity check below; the files were
+    # previously read and hashed twice.
+    recomputed = {
+        standard["id"]: _bundle_hashes(bundle, standard) for standard in document["standards"]
+    }
     added: list[str] = []
     changed: list[str] = []
     deprecated: list[str] = []
@@ -64,7 +73,7 @@ def sync(bundle: Path | None, sdk_root: Path, *, check_only: bool = False) -> Sy
             changed.append(identifier)
             if standard["status"] == "deprecated":
                 deprecated.append(identifier)
-        elif _bundle_hashes(bundle, standard) != _lock_hashes(prior):
+        elif recomputed[identifier] != _lock_hashes(prior):
             raise ValueError(
                 f"standards_version_required: {identifier} content changed without a "
                 "standards version increment"
@@ -73,11 +82,11 @@ def sync(bundle: Path | None, sdk_root: Path, *, check_only: bool = False) -> Sy
             # Status-only transition: same version and bytes, new deprecation.
             deprecated.append(identifier)
     removed = sorted(previous)
-    _verify_bundle_integrity(bundle, document)
+    _verify_bundle_integrity(document, recomputed)
     if check_only:
         _verify_vendored_tree(sdk_root, lock)
     else:
-        _write_vendored(bundle, sdk_root, document)
+        _write_vendored(bundle, sdk_root, document, recomputed)
     return SyncReport(
         tuple(sorted(added)),
         tuple(sorted(changed)),
@@ -98,10 +107,25 @@ def _load_bundle(bundle: Path) -> dict[str, Any]:
         document: dict[str, Any] = json.loads(manifest.read_bytes())
         if document.get("bundle_version") != 1:
             raise ValueError("bundle_version_unsupported")
+        seen_ids: set[str] = set()
         for standard in document["standards"]:
-            _ = standard["id"], standard["version"], standard["status"]
+            identifier = standard["id"]
+            _ = standard["version"], standard["status"]
+            if identifier in seen_ids:
+                # Every later stage keys per-standard state by id (last
+                # wins); a duplicate would otherwise surface as a bare
+                # KeyError from the integrity check instead of a refusal.
+                raise ValueError(f"bundle_manifest_invalid: duplicate standard id {identifier!r}")
+            seen_ids.add(identifier)
+            seen_paths: set[str] = set()
             for file in standard["files"]:
-                _guard_path(standard["id"], file["path"])
+                _guard_path(identifier, file["path"])
+                if file["path"] in seen_paths:
+                    raise ValueError(
+                        f"bundle_manifest_invalid: duplicate file path {file['path']!r} "
+                        f"in {identifier!r}"
+                    )
+                seen_paths.add(file["path"])
     except json.JSONDecodeError as exc:
         raise ValueError(f"bundle_manifest_invalid: {exc}") from exc
     except (KeyError, TypeError) as exc:
@@ -118,7 +142,10 @@ def _guard_path(identifier: str, path: str) -> None:
 
 
 def _read_lock(sdk_root: Path) -> dict[str, Any]:
-    path = sdk_root / LOCK_NAME
+    return _read_lock_file(sdk_root / LOCK_NAME)
+
+
+def _read_lock_file(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
@@ -154,20 +181,66 @@ def _lock_hashes(prior: dict[str, Any]) -> dict[str, str]:
     return {file["path"]: file["sha256"] for file in prior["files"]}
 
 
-def _verify_bundle_integrity(bundle: Path, document: dict[str, Any]) -> None:
+def _verify_bundle_integrity(
+    document: dict[str, Any], recomputed: dict[str, dict[str, str]]
+) -> None:
     """The manifest must describe the bytes actually present in the bundle.
 
     sha256 is the anchor: the lock records no sizes, only digests.
+    ``recomputed`` carries the digests already computed from the bundle's
+    files, so the bundle is read exactly once per sync.
     """
     for standard in document["standards"]:
+        actual = recomputed[standard["id"]]
         for file in standard["files"]:
-            digest = hashlib.sha256(_bundle_file(bundle, file["path"])).hexdigest()
-            if digest != file["sha256"]:
+            if actual[file["path"]] != file["sha256"]:
                 raise ValueError(f"hash_mismatch: {file['path']}")
 
 
+def _collect_stamps(tree: Path, standards: list[dict[str, Any]]) -> set[str]:
+    """Verify every standard's stamp is present; return their paths.
+
+    Shared by every verification lane (#9): a missing stamp is drift in
+    bundle-mode --check, the no-bundle lane, and the hatch build hook
+    alike — it would ride into wheels unnoticed.
+    """
+    stamps: set[str] = set()
+    for standard in standards:
+        stamp = f"{standard['id']}/{STAMP_NAME}"
+        if not (tree / stamp).is_file():
+            raise ValueError(f"stamp_missing: {stamp}")
+        stamps.add(stamp)
+    return stamps
+
+
+def _sweep_vendored_tree(tree: Path, recorded: set[str], stamps: set[str]) -> None:
+    """The one extras sweep (#9): every file in the vendored tree must be
+    lock-recorded, a per-standard stamp, or transient __pycache__ —
+    presentation.py imports the vendored plugin-ui contracts module, so
+    its bytecode cache appears beside the source; it is gitignored and
+    never packaged. Anything else is drift: it would ship in a wheel
+    built outside the gated paths."""
+    present = {
+        path.relative_to(tree).as_posix()
+        for path in tree.rglob("*")
+        if path.is_file() and "__pycache__" not in path.relative_to(tree).parts
+    }
+    for path in sorted(present - recorded - stamps):
+        raise ValueError(f"unexpected_vendored_file: {path}")
+
+
 def _verify_vendored_tree(sdk_root: Path, lock: dict[str, Any]) -> None:
-    """Recompute the vendored tree against the lock; refuse any drift."""
+    """Recompute the vendored tree against the lock; refuse any drift.
+
+    #9: this lane now verifies what the no-bundle lane verifies — per-file
+    digests over lock-recorded paths, stamp presence per standard, and the
+    extras sweep over the whole tree. A stray file or a missing stamp is
+    drift here too, not only in the bundle-free lane.
+    """
+    _verify_tree(sdk_root / VENDORED, lock)
+
+
+def _verify_tree(tree: Path, lock: dict[str, Any]) -> None:
     recorded = {
         file["path"]: file["sha256"]
         for standard in lock.get("standards", [])
@@ -175,13 +248,14 @@ def _verify_vendored_tree(sdk_root: Path, lock: dict[str, Any]) -> None:
     }
     if not recorded:
         raise ValueError("not_synced: no standards in the lock; run sync-standards first")
-    tree = sdk_root / VENDORED
     for path, digest in sorted(recorded.items()):
         target = tree / path
         if not target.is_file():
             raise ValueError(f"hash_mismatch: {path} missing from the vendored tree")
         if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
             raise ValueError(f"hash_mismatch: {path}")
+    stamps = _collect_stamps(tree, lock.get("standards", []))
+    _sweep_vendored_tree(tree, set(recorded), stamps)
 
 
 def _verify_self_consistency(sdk_root: Path) -> None:
@@ -192,35 +266,73 @@ def _verify_self_consistency(sdk_root: Path) -> None:
     unrecorded file in the tree or a missing stamp is drift too: either would
     ride into wheels unnoticed.
     """
-    lock = _read_lock(sdk_root)
-    _verify_vendored_tree(sdk_root, lock)
-    tree = sdk_root / VENDORED
-    standards = lock.get("standards", [])
-    stamps: set[str] = set()
-    for standard in standards:
-        stamp = f"{standard['id']}/{STAMP_NAME}"
-        if not (tree / stamp).is_file():
-            raise ValueError(f"stamp_missing: {stamp}")
-        stamps.add(stamp)
-    recorded = {file["path"] for standard in standards for file in standard["files"]}
-    # presentation.py imports the vendored plugin-ui contracts module, so its
-    # __pycache__ appears beside the source; it is gitignored and never
-    # packaged. Everything else in the tree must be lock-recorded or a stamp.
-    present = {
-        path.relative_to(tree).as_posix()
-        for path in tree.rglob("*")
-        if path.is_file() and "__pycache__" not in path.relative_to(tree).parts
-    }
-    for path in sorted(present - recorded - stamps):
-        raise ValueError(f"unexpected_vendored_file: {path}")
+    _verify_state(sdk_root / LOCK_NAME, sdk_root / VENDORED)
 
 
-def _write_vendored(bundle: Path, sdk_root: Path, document: dict[str, Any]) -> None:
-    """Rewrite the vendored tree and lock; vendored bytes match the bundle exactly."""
+def verify_installed() -> None:
+    """Verify an installed SDK's vendored tree against its packaged lock.
+
+    Installed distributions carry the lock inside the package (wheels since
+    the lock was force-included), so ``sync-standards --check`` can prove
+    integrity without a repository checkout — including the stamp and
+    extras checks the repository lanes run. Importing a bundle still needs
+    the checkout: it rewrites the source tree.
+    """
+    package = Path(str(files("benchweave_sdk")))
+    lock_path = package / LOCK_NAME
+    if not lock_path.is_file():
+        raise ValueError(
+            "lock_missing: this installed SDK does not package its standards lock; "
+            "reinstall a newer benchweave-sdk or run --check from a repository checkout"
+        )
+    _verify_state(lock_path, package / "standards")
+
+
+def _verify_state(lock_path: Path, tree: Path) -> None:
+    lock = _read_lock_file(lock_path)
+    _verify_tree(tree, lock)
+
+
+def _staging_paths(sdk_root: Path) -> tuple[Path, Path]:
+    """Where an in-flight sync stages the new tree and parks the old one.
+
+    Both live under ``<sdk_root>/.standards-sync/`` — outside ``src`` — so a
+    tree orphaned by a crash mid-sync cannot ship: the wheel packages
+    ``src/benchweave_sdk`` and the sdist's include list is explicit, and
+    neither names this directory. It sits inside the checkout, hence on the
+    vendored tree's own filesystem, which is what keeps the swap's renames
+    atomic.
+    """
+    root = sdk_root / STAGING_DIR
+    return root / "new", root / "old"
+
+
+def _write_vendored(
+    bundle: Path,
+    sdk_root: Path,
+    document: dict[str, Any],
+    recomputed: dict[str, dict[str, str]],
+) -> None:
+    """Rewrite the vendored tree and lock; vendored bytes match the bundle exactly.
+
+    The new tree is staged outside the package (``_staging_paths``) and
+    swapped in at the end, so an interrupted sync can never leave a
+    half-empty vendored tree behind (the old ``rmtree``-then-write order
+    destroyed the tree first) and never leaves staging debris where
+    packaging could pick it up. A crash between the swap's two renames
+    leaves the old tree parked and the vendored path absent, which
+    ``--check`` reports as missing files; the next sync sweeps both
+    leftovers and stages again. The lock is written only after the swap and
+    records the digests recomputed from the bundle's bytes, never the
+    manifest's claims (STD-2); a failure between swap and lock surfaces as
+    loud ``--check`` drift, never as a silently torn state.
+    """
     tree = sdk_root / VENDORED
-    if tree.exists():
-        shutil.rmtree(tree)
-    tree.mkdir(parents=True)
+    staging, retired = _staging_paths(sdk_root)
+    for leftover in (staging, retired):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    staging.mkdir(parents=True)
     lock: dict[str, Any] = {
         "lock_version": 1,
         "standards": [],
@@ -230,31 +342,55 @@ def _write_vendored(bundle: Path, sdk_root: Path, document: dict[str, Any]) -> N
             "notes": None,
         },
     }
-    for standard in document["standards"]:
-        stamps: list[str] = []
-        rows: list[dict[str, str]] = []
-        for file in standard["files"]:
-            raw = _bundle_file(bundle, file["path"])
-            target = tree / file["path"]
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(raw)
-            stamps.append(
-                STAMP_LINE.format(
-                    path=file["path"], identifier=standard["id"], version=standard["version"]
+    try:
+        for standard in document["standards"]:
+            digests = recomputed[standard["id"]]
+            stamps: list[str] = []
+            rows: list[dict[str, str]] = []
+            for file in standard["files"]:
+                raw = _bundle_file(bundle, file["path"])
+                target = staging / file["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(raw)
+                stamps.append(
+                    STAMP_LINE.format(
+                        path=file["path"], identifier=standard["id"], version=standard["version"]
+                    )
                 )
+                rows.append({"path": file["path"], "sha256": digests[file["path"]]})
+            stamp_file = staging / standard["id"] / STAMP_NAME
+            stamp_file.parent.mkdir(parents=True, exist_ok=True)
+            stamp_file.write_text("\n".join(stamps) + "\n", encoding="utf-8")
+            lock["standards"].append(
+                {
+                    "id": standard["id"],
+                    "version": standard["version"],
+                    "status": standard["status"],
+                    "files": rows,
+                }
             )
-            rows.append({"path": file["path"], "sha256": file["sha256"]})
-        stamp_file = tree / standard["id"] / STAMP_NAME
-        stamp_file.parent.mkdir(parents=True, exist_ok=True)
-        stamp_file.write_text("\n".join(stamps) + "\n", encoding="utf-8")
-        lock["standards"].append(
-            {
-                "id": standard["id"],
-                "version": standard["version"],
-                "status": standard["status"],
-                "files": rows,
-            }
-        )
+        if tree.exists():
+            tree.rename(retired)
+            try:
+                staging.rename(tree)
+            except BaseException:
+                # The old tree was already moved aside; put it back so a
+                # failed swap leaves the previous state in place, not a
+                # missing vendored tree.
+                retired.rename(tree)
+                raise
+            shutil.rmtree(retired)
+        else:
+            tree.parent.mkdir(parents=True, exist_ok=True)
+            staging.rename(tree)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        # Empty after a completed swap or a cleaned-up failure; a parked tree
+        # from a crash between the two renames keeps it, deliberately.
+        with contextlib.suppress(OSError):
+            staging.parent.rmdir()
     (sdk_root / LOCK_NAME).write_bytes(_canonical_json(lock))
 
 

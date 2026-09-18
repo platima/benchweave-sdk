@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -31,13 +32,13 @@ def _contract() -> Any:
     name = "benchweave_sdk._presentation_contract"
     vendored = Path(__file__).with_name("standards") / "plugin-ui" / "contracts.py"
     if not vendored.is_file():
-        # Editable checkout before the first standards sync only. Distributions
-        # contain the vendored tree, verified against its lock by the build hook.
-        vendored = Path(__file__).resolve().parents[4] / "src/benchweave/presentation/contracts.py"
-        if not vendored.is_file():
-            raise RuntimeError(
-                "SDK presentation validator missing; run sync-standards or reinstall the SDK"
-            )
+        # The vendored tree is committed (and, in distributions, verified
+        # against its lock by the build hook), so a missing validator is an
+        # incomplete tree — never a cue to execute code from outside the
+        # package.
+        raise RuntimeError(
+            "SDK presentation validator missing; run sync-standards or reinstall the SDK"
+        )
     spec = importlib.util.spec_from_file_location(name, vendored)
     if spec is None or spec.loader is None:
         raise RuntimeError("Cannot load the SDK presentation validator")
@@ -47,7 +48,10 @@ def _contract() -> Any:
     return module
 
 
+@cache
 def schemas() -> dict[str, Any]:
+    # Cached: the expansion walks every contract document and is re-requested
+    # for each envelope/preset validation; the corpus never changes in-process.
     result = dict(contract_documents())
     for document in tuple(result.values()):
         if "$id" in document:
@@ -60,15 +64,39 @@ def schemas() -> dict[str, Any]:
     return result
 
 
+# The errno an O_NOFOLLOW open reports for a symlink varies by kernel: Linux
+# and Darwin say ELOOP, FreeBSD says EMLINK — and with O_DIRECTORY also set,
+# Linux (6.x, measured) and Darwin say ENOTDIR instead, because the directory
+# check runs before the symlink check. The per-component lstat in read_file
+# decides the refusal; this set only classifies the residual window between
+# that lstat and the open, where a component was swapped for a symlink.
+_SYMLINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
+
+
 def read_file(path: Path, limit: int = 262144) -> bytes:
-    """Open bounded regular files without following symlinks in any component."""
+    """Open bounded regular files without following symlinks in any component.
+
+    Path-shape refusals — symlinked or non-directory components, non-regular
+    targets, oversize input — raise ``ValueError`` on every platform; absence
+    and permission failures keep their ``OSError`` face. On POSIX every
+    component is ``lstat``-ed relative to the walked directory descriptor
+    before it is opened, so a symlink is refused by inspection on every
+    kernel rather than by whichever errno that kernel's ``O_NOFOLLOW`` open
+    happens to report.
+    """
+    if limit < 0:
+        raise ValueError("Input byte limit exceeded")
+    if sys.platform == "win32":
+        return _read_file_no_dirfd(path, limit)
     parts = path.absolute().parts
     directory = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in parts[1:-1]:
+            _refuse_symlink(part, directory)
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
             os.close(directory)
             directory = child
+        _refuse_symlink(parts[-1], directory)
         descriptor = os.open(
             parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
         )
@@ -80,8 +108,78 @@ def read_file(path: Path, limit: int = 262144) -> bytes:
             if len(raw) > limit:
                 raise ValueError("Input byte limit exceeded")
             return raw
+    except OSError as exc:
+        # Align refusal classes with the Windows branch: a path whose SHAPE is
+        # wrong is a domain refusal (ValueError), matching the messages the
+        # explicit checks raise; environment errors (ENOENT, EACCES) pass
+        # through unchanged. A symlink normally never reaches here —
+        # _refuse_symlink saw it first — so the symlink mapping is the
+        # backstop for a component swapped between its lstat and its open.
+        if exc.errno in _SYMLINK_ERRNOS:
+            raise ValueError("Input path must not contain symlinked components") from exc
+        if exc.errno in (errno.ENOTDIR, errno.EISDIR):
+            raise ValueError("Input must be a bounded regular file") from exc
+        raise
     finally:
         os.close(directory)
+
+
+def _refuse_symlink(name: str, directory: int) -> None:
+    """``lstat`` one path component relative to ``directory``; refuse a symlink.
+
+    Inspection, not errno, is what makes the refusal identical on Linux,
+    Darwin and the BSDs. Absence and permission failures propagate as the
+    ``OSError`` they are.
+    """
+    details = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if stat.S_ISLNK(details.st_mode):
+        raise ValueError("Input path must not contain symlinked components")
+
+
+def _read_file_no_dirfd(path: Path, limit: int) -> bytes:
+    """``read_file`` for platforms without ``O_NOFOLLOW``/``dir_fd`` (Windows).
+
+    Each component is inspected with ``lstat`` — refusing symlinks and
+    reparse points (junctions, mount points) — and a same-file check after
+    the open ties the descriptor back to the inspected final component. The
+    residual race on intermediate components is accepted for an offline
+    authoring tool; the POSIX branch keeps the race-free ``dir_fd`` walk.
+    """
+    resolved = path.absolute()
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    current = Path(resolved.parts[0])
+    details = os.lstat(current)
+    for part in resolved.parts[1:]:
+        current = current / part
+        try:
+            details = os.lstat(current)
+        except NotADirectoryError as exc:
+            # A regular file sitting where a directory component should be —
+            # the same refusal class the POSIX branch maps ENOTDIR to.
+            raise ValueError("Input must be a bounded regular file") from exc
+        is_reparse = getattr(details, "st_file_attributes", 0) & reparse_point
+        if stat.S_ISLNK(details.st_mode) or is_reparse:
+            raise ValueError("Input path must not contain symlinked components")
+    if not stat.S_ISREG(details.st_mode):
+        # Refuse directories and other non-regular targets before the open,
+        # where Windows would otherwise fail with a platform-specific OSError.
+        raise ValueError("Input must be a bounded regular file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    descriptor = os.open(resolved, flags)
+    with os.fdopen(descriptor, "rb") as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise ValueError("Input must be a bounded regular file")
+        # samestat against the WALK's own lstat of the final component, not a
+        # fresh post-open lstat: the descriptor is thereby tied to the very
+        # file that was verified not to be a symlink or reparse point, which
+        # closes the swap-in/swap-out window a re-run lstat would miss.
+        if not os.path.samestat(metadata, details):
+            raise ValueError("Input path changed while being read")
+        raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("Input byte limit exceeded")
+        return raw
 
 
 def validate_preset(
